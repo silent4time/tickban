@@ -2,7 +2,7 @@
 /**
  * Plugin Name: تیک‌بان
  * Description: افزونهٔ پایش کاریونیت. نام، آدرس، روز و ساعت بازدید سایت‌ها را می‌گیرد، سر موعد چک می‌کند و آخرین وضعیت را سبز یا قرمز نشان می‌دهد.
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: کاریونیت
  * Author URI: https://carunit.ir
  * Text Domain: tickban
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-const TICKBAN_VERSION = '1.2.0';
+const TICKBAN_VERSION = '1.3.0';
 const TICKBAN_MONITORS = 'tickban_monitors';
 const TICKBAN_LOG = 'tickban_log';
 const TICKBAN_SETTINGS = 'tickban_settings';
@@ -199,6 +199,8 @@ function tickban_save_bale(): void
     update_option(TICKBAN_SETTINGS, [
         'bale_token' => sanitize_text_field(wp_unslash($_POST['bale_token'] ?? '')),
         'bale_chat' => sanitize_text_field(wp_unslash($_POST['bale_chat'] ?? '')),
+        'tg_token' => sanitize_text_field(wp_unslash($_POST['tg_token'] ?? '')),
+        'tg_chat' => sanitize_text_field(wp_unslash($_POST['tg_chat'] ?? '')),
         'notify_ok' => !empty($_POST['notify_ok']),
         'notify_fail' => !empty($_POST['notify_fail']),
     ], false);
@@ -390,29 +392,82 @@ function tickban_hit(array $m, string $slot, bool $manual): array
     return $row;
 }
 
+function tickban_fa_digits(string $value): string
+{
+    return strtr($value, ['0' => '۰', '1' => '۱', '2' => '۲', '3' => '۳', '4' => '۴', '5' => '۵', '6' => '۶', '7' => '۷', '8' => '۸', '9' => '۹']);
+}
+
+function tickban_jalali(int $gy, int $gm, int $gd): string
+{
+    $g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    $gy2 = ($gm > 2) ? ($gy + 1) : $gy;
+    $days = 355666 + (365 * $gy) + (int) (($gy2 + 3) / 4) - (int) (($gy2 + 99) / 100) + (int) (($gy2 + 399) / 400) + $gd + $g_d_m[$gm - 1];
+    $jy = -1595 + (33 * (int) ($days / 12053));
+    $days %= 12053;
+    $jy += 4 * (int) ($days / 1461);
+    $days %= 1461;
+    if ($days > 365) {
+        $jy += (int) (($days - 1) / 365);
+        $days = ($days - 1) % 365;
+    }
+    if ($days < 186) {
+        $jm = 1 + (int) ($days / 31);
+        $jd = 1 + ($days % 31);
+    } else {
+        $jm = 7 + (int) (($days - 186) / 30);
+        $jd = 1 + (($days - 186) % 30);
+    }
+    return sprintf('%04d/%02d/%02d', $jy, $jm, $jd);
+}
+
+function tickban_message(array $m, array $row): string
+{
+    $name = $m['label'] !== '' ? $m['label'] : 'بدون نام';
+    $host = (string) wp_parse_url($m['url'], PHP_URL_HOST);
+    $date = tickban_jalali((int) wp_date('Y'), (int) wp_date('n'), (int) wp_date('j'));
+    $status = !empty($row['ok']) ? 'سالم' : 'خطا (کد ' . (int) $row['code'] . ')';
+    $lines = [
+        'تیک‌بان',
+        'نام سایت: ' . $name,
+        'دامنه: ' . ($host !== '' ? $host : $m['url']),
+        'وضعیت: ' . $status,
+        'ساعت: ' . ($row['at'] ?? ''),
+        'تاریخ: ' . $date,
+    ];
+    if (empty($row['ok']) && !empty($row['error'])) {
+        $lines[] = 'خطا: ' . $row['error'];
+    }
+    return tickban_fa_digits(implode("\n", $lines));
+}
+
 function tickban_notify(array $m, array $row): void
 {
     $s = tickban_settings();
-    $token = trim((string) ($s['bale_token'] ?? ''));
-    $chat = trim((string) ($s['bale_chat'] ?? ''));
-    if ($token === '' || $chat === '') {
-        return;
-    }
     if ($row['ok'] && empty($s['notify_ok'])) {
         return;
     }
     if (!$row['ok'] && empty($s['notify_fail'])) {
         return;
     }
-    $name = $m['label'] !== '' ? $m['label'] : $m['url'];
-    $text = $row['ok']
-        ? "تیک‌بان\n{$name}\nساعت {$row['slot']} سالم بود."
-        : "تیک‌بان\n{$name}\nساعت {$row['slot']} جواب نداد (کد {$row['code']}).";
-    wp_remote_post('https://tapi.bale.ai/bot' . rawurlencode($token) . '/sendMessage', [
-        'timeout' => 12,
-        'headers' => ['Content-Type' => 'application/json'],
-        'body' => wp_json_encode(['chat_id' => $chat, 'text' => $text]),
-    ]);
+    $text = tickban_message($m, $row);
+    $bale_token = trim((string) ($s['bale_token'] ?? ''));
+    $bale_chat = trim((string) ($s['bale_chat'] ?? ''));
+    if ($bale_token !== '' && $bale_chat !== '') {
+        wp_remote_post('https://tapi.bale.ai/bot' . rawurlencode($bale_token) . '/sendMessage', [
+            'timeout' => 12,
+            'headers' => ['Content-Type' => 'application/json'],
+            'body' => wp_json_encode(['chat_id' => $bale_chat, 'text' => $text]),
+        ]);
+    }
+    $tg_token = trim((string) ($s['tg_token'] ?? ''));
+    $tg_chat = trim((string) ($s['tg_chat'] ?? ''));
+    if ($tg_token !== '' && $tg_chat !== '') {
+        wp_remote_post('https://api.telegram.org/bot' . rawurlencode($tg_token) . '/sendMessage', [
+            'timeout' => 12,
+            'headers' => ['Content-Type' => 'application/json'],
+            'body' => wp_json_encode(['chat_id' => $tg_chat, 'text' => $text]),
+        ]);
+    }
 }
 
 function tickban_page(): void
@@ -438,7 +493,7 @@ function tickban_page(): void
         echo '<div class="tb-note ok">سایت حذف شد.</div>';
     }
     if (!empty($_GET['bale'])) {
-        echo '<div class="tb-note ok">تنظیم بله ذخیره شد.</div>';
+        echo '<div class="tb-note ok">تنظیم ربات‌ها ذخیره شد.</div>';
     }
     if (!empty($_GET['err'])) {
         echo '<div class="tb-note bad">آدرس سایت معتبر نیست.</div>';
@@ -549,13 +604,18 @@ function tickban_page(): void
     echo '<form class="tb-card tb-bale" method="post" action="' . esc_url(admin_url('admin-post.php')) . '">';
     wp_nonce_field('tickban_save_bale');
     echo '<input type="hidden" name="action" value="tickban_save_bale">';
-    echo '<h2>خبر به بله</h2><div class="tb-grid">';
+    echo '<h2>ربات‌ها، یکی برای همهٔ سایت‌ها</h2>';
+    echo '<p class="tb-help">یک ربات بله و یک ربات تلگرام کافی است. بعد از هر چک، برای هر سایت یک پیام جدا می‌رود: نام، دامنه، وضعیت، ساعت و تاریخ شمسی.</p>';
+    echo '<h3>بله</h3><div class="tb-grid">';
     echo '<label>توکن ربات<input type="text" name="bale_token" value="' . esc_attr($s['bale_token'] ?? '') . '" placeholder="123456:ABC"></label>';
     echo '<label>آیدی عددی گیرنده<input type="text" name="bale_chat" value="' . esc_attr($s['bale_chat'] ?? '') . '"></label></div>';
+    echo '<h3>تلگرام</h3><div class="tb-grid">';
+    echo '<label>توکن ربات<input type="text" name="tg_token" value="' . esc_attr($s['tg_token'] ?? '') . '" placeholder="123456:ABC"></label>';
+    echo '<label>آیدی عددی گیرنده<input type="text" name="tg_chat" value="' . esc_attr($s['tg_chat'] ?? '') . '" placeholder="-100..."></label></div>';
     echo '<label class="tb-every"><input type="checkbox" name="notify_ok"' . (!empty($s['notify_ok']) ? ' checked' : '') . '> بعد از چک موفق پیام بده</label>';
     echo '<label class="tb-every"><input type="checkbox" name="notify_fail"' . (!empty($s['notify_fail']) ? ' checked' : '') . '> اگر جواب نداد هم پیام بده</label>';
-    echo '<button class="tb-btn" type="submit">ذخیره بله</button></form>';
-    echo '<p class="tb-foot">تیک‌بان ۱.۲.۰ · کاریونیت</p></div>';
+    echo '<button class="tb-btn" type="submit">ذخیره ربات‌ها</button></form>';
+    echo '<p class="tb-foot">تیک‌بان ۱.۳.۰ · کاریونیت</p></div>';
 }
 
 function tickban_css(): void
