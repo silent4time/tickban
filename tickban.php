@@ -2,7 +2,7 @@
 /**
  * Plugin Name: تیک‌بان
  * Description: افزونهٔ پایش کاریونیت. نام، آدرس، روز و ساعت بازدید سایت‌ها را می‌گیرد، سر موعد چک می‌کند و آخرین وضعیت را سبز یا قرمز نشان می‌دهد.
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: کاریونیت
  * Author URI: https://carunit.ir
  * Text Domain: tickban
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-const TICKBAN_VERSION = '1.3.0';
+const TICKBAN_VERSION = '1.3.1';
 const TICKBAN_MONITORS = 'tickban_monitors';
 const TICKBAN_LOG = 'tickban_log';
 const TICKBAN_SETTINGS = 'tickban_settings';
@@ -68,7 +68,6 @@ function tickban_assets(string $hook): void
     if ($hook !== 'toplevel_page_tickban') {
         return;
     }
-    wp_enqueue_style('tickban-font', 'https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700;800;900&display=swap', [], null);
 }
 
 function tickban_week(): array
@@ -615,13 +614,17 @@ function tickban_page(): void
     echo '<label class="tb-every"><input type="checkbox" name="notify_ok"' . (!empty($s['notify_ok']) ? ' checked' : '') . '> بعد از چک موفق پیام بده</label>';
     echo '<label class="tb-every"><input type="checkbox" name="notify_fail"' . (!empty($s['notify_fail']) ? ' checked' : '') . '> اگر جواب نداد هم پیام بده</label>';
     echo '<button class="tb-btn" type="submit">ذخیره ربات‌ها</button></form>';
-    echo '<p class="tb-foot">تیک‌بان ۱.۳.۰ · کاریونیت</p></div>';
+    echo '<p class="tb-foot">تیک‌بان ۱.۳.۱ · کاریونیت</p></div>';
 }
 
 function tickban_css(): void
 {
+    $font = get_theme_file_uri('assets/fonts/Vazirmatn-wght.woff2');
     echo '<style>
-    .tb{font-family:Vazirmatn,Tahoma,sans-serif;max-width:980px;color:#0D0D0D}
+    @font-face{font-family:Vazirmatn;src:url("' . esc_url($font) . '") format("woff2");font-weight:100 900;font-display:swap}
+    .tb,.tb *{font-family:Vazirmatn,Tahoma,sans-serif !important}
+    .tb .dashicons,.tb .dashicons:before{font-family:dashicons !important}
+    .tb{max-width:980px;color:#0D0D0D}
     .tb-head{display:flex;gap:14px;align-items:center;margin:18px 0 8px}
     .tb-mark{width:52px;height:52px;border-radius:14px;background:#F5C518;color:#0D0D0D;display:grid;place-items:center;font-weight:900;font-size:24px}
     .tb h1{font-size:28px;font-weight:900;margin:0}
