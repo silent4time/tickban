@@ -2,7 +2,7 @@
 /**
  * Plugin Name: تیک‌بان
  * Description: آدرس‌هایی که می‌دهید را در روز و ساعت انتخابی چک می‌کند، در تقویم تیک می‌زند و در صورت موفقیت به بله خبر می‌دهد.
- * Version: 1.1.0
+ * Version: 1.1.1
  * Author: Tickban
  * Text Domain: tickban
  */
@@ -11,7 +11,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-const TICKBAN_VERSION = '1.1.0';
+const TICKBAN_VERSION = '1.1.1';
 const TICKBAN_MONITORS = 'tickban_monitors';
 const TICKBAN_LOG = 'tickban_log';
 const TICKBAN_SETTINGS = 'tickban_settings';
@@ -179,27 +179,90 @@ function tickban_fetch(string $url): array
         'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language' => 'fa,en;q=0.8',
     ];
+    $res = tickban_request($url, $headers, '');
+    $fail = tickban_fail($res);
+    if ($fail !== '' && tickban_dns_fail($fail)) {
+        $ip = tickban_resolve($url);
+        if ($ip !== '') {
+            $res = tickban_request($url, $headers, $ip);
+            $fail = tickban_fail($res);
+        }
+    }
+    if ($fail !== '') {
+        return ['code' => 0, 'error' => $fail];
+    }
+    $code = (int) wp_remote_retrieve_response_code($res);
+    if ($code === 403 || $code === 0) {
+        $ip = tickban_resolve($url);
+        $retry = tickban_request($url, $headers + ['Cache-Control' => 'no-cache'], $ip);
+        if (!is_wp_error($retry)) {
+            $res = $retry;
+            $code = (int) wp_remote_retrieve_response_code($res);
+            $fail = '';
+        }
+    }
+    return ['code' => $code, 'error' => $fail];
+}
+
+function tickban_fail($res): string
+{
+    return is_wp_error($res) ? $res->get_error_message() : '';
+}
+
+function tickban_dns_fail(string $msg): bool
+{
+    return stripos($msg, 'Resolving timed out') !== false || stripos($msg, 'Could not resolve') !== false;
+}
+
+function tickban_request(string $url, array $headers, string $ip)
+{
+    $pin = null;
+    if ($ip !== '' && filter_var($ip, FILTER_VALIDATE_IP)) {
+        $host = (string) wp_parse_url($url, PHP_URL_HOST);
+        $port = wp_parse_url($url, PHP_URL_SCHEME) === 'http' ? 80 : 443;
+        $pin = static function ($handle) use ($host, $port, $ip) {
+            if (is_resource($handle) || $handle instanceof \CurlHandle) {
+                curl_setopt($handle, CURLOPT_RESOLVE, [$host . ':' . $port . ':' . $ip]);
+            }
+        };
+        add_action('http_api_curl', $pin);
+    }
     $res = wp_remote_get($url, [
         'timeout' => 25,
         'redirection' => 5,
         'headers' => $headers,
         'sslverify' => true,
     ]);
-    if (is_wp_error($res)) {
-        return ['code' => 0, 'error' => $res->get_error_message()];
+    if ($pin) {
+        remove_action('http_api_curl', $pin);
     }
-    $code = (int) wp_remote_retrieve_response_code($res);
-    if ($code === 403 || $code === 0) {
-        $res = wp_remote_get($url, [
-            'timeout' => 25,
-            'redirection' => 5,
-            'headers' => $headers + ['Cache-Control' => 'no-cache'],
-        ]);
-        if (!is_wp_error($res)) {
-            $code = (int) wp_remote_retrieve_response_code($res);
+    return $res;
+}
+
+function tickban_resolve(string $url): string
+{
+    $host = (string) wp_parse_url($url, PHP_URL_HOST);
+    if ($host === '') {
+        return '';
+    }
+    $cached = get_option('tickban_ips', []);
+    $cached = is_array($cached) ? $cached : [];
+    $res = wp_remote_get('https://1.1.1.1/dns-query?name=' . rawurlencode($host) . '&type=A', [
+        'timeout' => 12,
+        'headers' => ['Accept' => 'application/dns-json', 'User-Agent' => 'tickban'],
+    ]);
+    if (!is_wp_error($res)) {
+        $data = json_decode((string) wp_remote_retrieve_body($res), true);
+        foreach (($data['Answer'] ?? []) as $ans) {
+            $ip = (string) ($ans['data'] ?? '');
+            if ((int) ($ans['type'] ?? 0) === 1 && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                $cached[$host] = $ip;
+                update_option('tickban_ips', $cached, false);
+                return $ip;
+            }
         }
     }
-    return ['code' => $code, 'error' => ''];
+    return (string) ($cached[$host] ?? '');
 }
 
 function tickban_hit(array $m, string $slot, bool $manual): array
