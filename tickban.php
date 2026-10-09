@@ -1,9 +1,10 @@
 <?php
 /**
  * Plugin Name: تیک‌بان
- * Description: آدرس‌هایی که می‌دهید را در روز و ساعت انتخابی چک می‌کند، در تقویم تیک می‌زند و در صورت موفقیت به بله خبر می‌دهد.
- * Version: 1.1.1
- * Author: Tickban
+ * Description: افزونهٔ پایش کاریونیت. نام، آدرس، روز و ساعت بازدید سایت‌ها را می‌گیرد، سر موعد چک می‌کند و آخرین وضعیت را سبز یا قرمز نشان می‌دهد.
+ * Version: 1.2.0
+ * Author: کاریونیت
+ * Author URI: https://carunit.ir
  * Text Domain: tickban
  */
 
@@ -11,7 +12,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-const TICKBAN_VERSION = '1.1.1';
+const TICKBAN_VERSION = '1.2.0';
 const TICKBAN_MONITORS = 'tickban_monitors';
 const TICKBAN_LOG = 'tickban_log';
 const TICKBAN_SETTINGS = 'tickban_settings';
@@ -19,7 +20,10 @@ const TICKBAN_SETTINGS = 'tickban_settings';
 add_action('init', 'tickban_run_due');
 add_action('tickban_cron', 'tickban_run_due');
 add_action('admin_menu', 'tickban_menu');
-add_action('admin_post_tickban_save', 'tickban_save');
+add_action('admin_enqueue_scripts', 'tickban_assets');
+add_action('admin_post_tickban_save_site', 'tickban_save_site');
+add_action('admin_post_tickban_save_bale', 'tickban_save_bale');
+add_action('admin_post_tickban_delete', 'tickban_delete');
 add_action('admin_post_tickban_check', 'tickban_check_now');
 register_activation_hook(__FILE__, 'tickban_activate');
 register_deactivation_hook(__FILE__, 'tickban_deactivate');
@@ -59,6 +63,48 @@ function tickban_menu(): void
     add_menu_page('تیک‌بان', 'تیک‌بان', 'manage_options', 'tickban', 'tickban_page', 'dashicons-yes-alt', 58);
 }
 
+function tickban_assets(string $hook): void
+{
+    if ($hook !== 'toplevel_page_tickban') {
+        return;
+    }
+    wp_enqueue_style('tickban-font', 'https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700;800;900&display=swap', [], null);
+}
+
+function tickban_week(): array
+{
+    return ['6' => 'شنبه', '0' => 'یکشنبه', '1' => 'دوشنبه', '2' => 'سه‌شنبه', '3' => 'چهارشنبه', '4' => 'پنجشنبه', '5' => 'جمعه'];
+}
+
+function tickban_find(string $id): ?array
+{
+    foreach (tickban_monitors() as $m) {
+        if (($m['id'] ?? '') === $id) {
+            return $m;
+        }
+    }
+    return null;
+}
+
+function tickban_history(string $id): array
+{
+    $rows = [];
+    foreach (tickban_log() as $key => $row) {
+        if (str_starts_with((string) $key, $id . '|') && is_array($row)) {
+            $parts = explode('|', (string) $key);
+            $row['date'] = $parts[1] ?? '';
+            $rows[] = $row;
+        }
+    }
+    return array_reverse($rows);
+}
+
+function tickban_latest(string $id): ?array
+{
+    $rows = tickban_history($id);
+    return $rows[0] ?? null;
+}
+
 function tickban_parse_times(string $raw): array
 {
     preg_match_all('/([01]?\d|2[0-3]):([0-5]\d)/', $raw, $m, PREG_SET_ORDER);
@@ -82,45 +128,96 @@ function tickban_parse_times(string $raw): array
     return $clean;
 }
 
-function tickban_save(): void
+function tickban_days_label(array $m): string
+{
+    if (($m['mode'] ?? 'daily') !== 'pick' || empty($m['days'])) {
+        return 'هر روز';
+    }
+    $week = tickban_week();
+    $names = [];
+    foreach ($week as $num => $title) {
+        if (in_array((string) $num, $m['days'], true)) {
+            $names[] = $title;
+        }
+    }
+    return $names ? implode('، ', $names) : 'هر روز';
+}
+
+function tickban_save_site(): void
 {
     if (!current_user_can('manage_options')) {
         wp_die('مجوز ندارید');
     }
-    check_admin_referer('tickban_save');
-    $settings = [
+    check_admin_referer('tickban_save_site');
+    $url = esc_url_raw(trim((string) wp_unslash($_POST['url'] ?? '')));
+    if ($url === '' || !preg_match('#^https?://#i', $url)) {
+        wp_safe_redirect(admin_url('admin.php?page=tickban&err=url'));
+        exit;
+    }
+    $days = isset($_POST['days']) ? (array) wp_unslash($_POST['days']) : [];
+    $days = array_values(array_intersect(array_map('strval', $days), ['0', '1', '2', '3', '4', '5', '6']));
+    $mode = (($days && ($_POST['mode'] ?? '') === 'pick') || ($days && empty($_POST['everyday']))) ? 'pick' : 'daily';
+    if (!empty($_POST['everyday'])) {
+        $mode = 'daily';
+        $days = [];
+    }
+    $times = tickban_parse_times((string) wp_unslash($_POST['times'] ?? '09:00'));
+    if (!$times) {
+        $times = ['09:00'];
+    }
+    $id = sanitize_text_field(wp_unslash($_POST['id'] ?? ''));
+    $row = [
+        'id' => $id !== '' ? $id : substr(md5($url . microtime(true)), 0, 8),
+        'label' => sanitize_text_field(wp_unslash($_POST['label'] ?? '')),
+        'url' => $url,
+        'mode' => $mode,
+        'days' => $days,
+        'times' => $times,
+    ];
+    $monitors = tickban_monitors();
+    $found = false;
+    foreach ($monitors as $i => $m) {
+        if (($m['id'] ?? '') === $row['id']) {
+            $monitors[$i] = $row;
+            $found = true;
+        }
+    }
+    if (!$found) {
+        $monitors[] = $row;
+    }
+    update_option(TICKBAN_MONITORS, array_values($monitors), false);
+    wp_safe_redirect(admin_url('admin.php?page=tickban&saved=1'));
+    exit;
+}
+
+function tickban_save_bale(): void
+{
+    if (!current_user_can('manage_options')) {
+        wp_die('مجوز ندارید');
+    }
+    check_admin_referer('tickban_save_bale');
+    update_option(TICKBAN_SETTINGS, [
         'bale_token' => sanitize_text_field(wp_unslash($_POST['bale_token'] ?? '')),
         'bale_chat' => sanitize_text_field(wp_unslash($_POST['bale_chat'] ?? '')),
         'notify_ok' => !empty($_POST['notify_ok']),
         'notify_fail' => !empty($_POST['notify_fail']),
-    ];
-    update_option(TICKBAN_SETTINGS, $settings, false);
+    ], false);
+    wp_safe_redirect(admin_url('admin.php?page=tickban&bale=1'));
+    exit;
+}
 
-    $urls = isset($_POST['url']) ? (array) wp_unslash($_POST['url']) : [];
-    $labels = isset($_POST['label']) ? (array) wp_unslash($_POST['label']) : [];
-    $modes = isset($_POST['mode']) ? (array) wp_unslash($_POST['mode']) : [];
-    $times = isset($_POST['times']) ? (array) wp_unslash($_POST['times']) : [];
-    $days_in = isset($_POST['days']) ? (array) wp_unslash($_POST['days']) : [];
-    $monitors = [];
-    foreach ($urls as $i => $url) {
-        $url = esc_url_raw(trim((string) $url));
-        if ($url === '' || !preg_match('#^https?://#i', $url)) {
-            continue;
-        }
-        $day_list = isset($days_in[$i]) ? (array) $days_in[$i] : [];
-        $day_list = array_values(array_intersect(array_map('strval', $day_list), ['0', '1', '2', '3', '4', '5', '6']));
-        $mode = (($modes[$i] ?? '') === 'pick') ? 'pick' : 'daily';
-        $monitors[] = [
-            'id' => substr(md5($url . $i), 0, 8),
-            'label' => sanitize_text_field($labels[$i] ?? ''),
-            'url' => $url,
-            'mode' => $mode,
-            'days' => $day_list,
-            'times' => tickban_parse_times((string) ($times[$i] ?? '09:00')),
-        ];
+function tickban_delete(): void
+{
+    if (!current_user_can('manage_options')) {
+        wp_die('مجوز ندارید');
     }
+    check_admin_referer('tickban_delete');
+    $id = sanitize_text_field(wp_unslash($_GET['id'] ?? ''));
+    $monitors = array_values(array_filter(tickban_monitors(), static function ($m) use ($id) {
+        return ($m['id'] ?? '') !== $id;
+    }));
     update_option(TICKBAN_MONITORS, $monitors, false);
-    wp_safe_redirect(admin_url('admin.php?page=tickban&saved=1'));
+    wp_safe_redirect(admin_url('admin.php?page=tickban&deleted=1'));
     exit;
 }
 
@@ -131,23 +228,26 @@ function tickban_check_now(): void
     }
     check_admin_referer('tickban_check');
     $id = sanitize_text_field(wp_unslash($_GET['id'] ?? ''));
+    $ok = true;
     foreach (tickban_monitors() as $m) {
         if ($m['id'] === $id) {
-            tickban_hit($m, wp_date('H:i'), true);
+            $row = tickban_hit($m, wp_date('H:i'), true);
+            $ok = !empty($row['ok']);
         }
     }
-    wp_safe_redirect(admin_url('admin.php?page=tickban&checked=1'));
+    $flag = $ok ? 'checked=1' : 'failed=1';
+    wp_safe_redirect(admin_url('admin.php?page=tickban&view=' . rawurlencode($id) . '&' . $flag));
     exit;
 }
 
 function tickban_due(array $m, string $date, string $now): array
 {
     $w = wp_date('w', strtotime($date));
-    if ($m['mode'] === 'pick' && !in_array((string) $w, $m['days'], true)) {
+    if (($m['mode'] ?? 'daily') === 'pick' && !in_array((string) $w, $m['days'] ?? [], true)) {
         return [];
     }
     $due = [];
-    foreach ($m['times'] as $t) {
+    foreach ($m['times'] ?? [] as $t) {
         if ($t <= $now) {
             $due[] = $t;
         }
@@ -196,8 +296,7 @@ function tickban_fetch(string $url): array
         $ip = tickban_resolve($url);
         $retry = tickban_request($url, $headers + ['Cache-Control' => 'no-cache'], $ip);
         if (!is_wp_error($retry)) {
-            $res = $retry;
-            $code = (int) wp_remote_retrieve_response_code($res);
+            $code = (int) wp_remote_retrieve_response_code($retry);
             $fail = '';
         }
     }
@@ -322,101 +421,187 @@ function tickban_page(): void
         return;
     }
     $monitors = tickban_monitors();
-    if (!$monitors) {
-        $monitors[] = ['label' => 'کلیدبان', 'url' => 'https://kelidban.wuaze.com/', 'mode' => 'daily', 'days' => [], 'times' => ['16:41']];
-    }
     $s = tickban_settings();
-    $log = tickban_log();
-    $month = isset($_GET['month']) ? sanitize_text_field(wp_unslash($_GET['month'])) : wp_date('Y-m');
-    if (!preg_match('/^\d{4}-\d{2}$/', $month)) {
-        $month = wp_date('Y-m');
-    }
-    $start = strtotime($month . '-01');
-    $count = (int) wp_date('t', $start);
-    $pad = (int) wp_date('w', $start);
-    $names = ['ی', 'د', 'س', 'چ', 'پ', 'ج', 'ش'];
-    $week = ['0' => 'یکشنبه', '1' => 'دوشنبه', '2' => 'سه‌شنبه', '3' => 'چهارشنبه', '4' => 'پنجشنبه', '5' => 'جمعه', '6' => 'شنبه'];
+    $edit_id = sanitize_text_field(wp_unslash($_GET['edit'] ?? ''));
+    $view_id = sanitize_text_field(wp_unslash($_GET['view'] ?? ''));
+    $edit = $edit_id !== '' ? tickban_find($edit_id) : null;
+    $view = $view_id !== '' ? tickban_find($view_id) : null;
+    $week = tickban_week();
     echo '<div class="wrap tb">';
-    echo '<style>
-      .tb{font-family:tahoma,sans-serif;max-width:980px}
-      .tb h1{font-weight:700}
-      .tb-card{background:#fff;border:1px solid #e7e5e4;border-radius:16px;padding:16px 18px;margin:14px 0}
-      .tb-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-      .tb label{display:block;font-size:13px;margin:8px 0 4px}
-      .tb input[type=text],.tb input[type=url]{width:100%;padding:8px 10px;border:1px solid #d6d3d1;border-radius:10px}
-      .tb-mon{border:1px dashed #d6d3d1;border-radius:14px;padding:12px;margin:10px 0}
-      .tb-days label{display:inline-flex;gap:4px;margin-left:8px}
-      .tb-cal{border-collapse:collapse;width:100%;max-width:640px}
-      .tb-cal th,.tb-cal td{border:1px solid #e7e5e4;text-align:center;height:58px;width:14%}
-      .tb-ok{background:#dcfce7}.tb-bad{background:#fee2e2}
-      .tb-note{color:#57534e}
-    </style>';
-    echo '<h1>تیک‌بان</h1><p class="tb-note">آدرس‌ها را سر ساعت انتخابی چک می‌کند. بین دو ساعت حداقل یک ساعت فاصله لازم است. تیک فقط وقتی می‌خورد که سایت وردپرس همان روز باز شود یا کرون ساعتی اجرا شود.</p>';
+    tickban_css();
+    echo '<header class="tb-head"><span class="tb-mark">ت</span><div><h1>تیک‌بان</h1><p>پایش زمان‌بندی‌شدهٔ سایت‌ها، ساختهٔ کاریونیت</p></div></header>';
+    echo '<section class="tb-intro"><p>تیک‌بان آدرس‌هایی که می‌دهید را در روز و ساعت انتخابی باز می‌کند. اگر سایت جواب بدهد وضعیت سبز می‌شود و اگر خطا بدهد قرمز. بین دو ساعت حداقل یک ساعت فاصله لازم است. چک وقتی انجام می‌شود که پیشخوان همان روز باز شود یا کرون ساعتی وردپرس اجرا شود.</p></section>';
     if (!empty($_GET['saved'])) {
-        echo '<div class="notice notice-success"><p>ذخیره شد.</p></div>';
+        echo '<div class="tb-note ok">سایت ثبت شد.</div>';
+    }
+    if (!empty($_GET['deleted'])) {
+        echo '<div class="tb-note ok">سایت حذف شد.</div>';
+    }
+    if (!empty($_GET['bale'])) {
+        echo '<div class="tb-note ok">تنظیم بله ذخیره شد.</div>';
+    }
+    if (!empty($_GET['err'])) {
+        echo '<div class="tb-note bad">آدرس سایت معتبر نیست.</div>';
     }
     if (!empty($_GET['checked'])) {
-        echo '<div class="notice notice-success"><p>چک دستی انجام شد.</p></div>';
+        echo '<div class="tb-note ok">تست آنی انجام شد و سایت سالم بود.</div>';
     }
-    echo '<div class="tb-card"><h2>تقویم این ماه</h2><table class="tb-cal"><tr>';
-    foreach ($names as $n) {
-        echo '<th>' . $n . '</th>';
+    if (!empty($_GET['failed'])) {
+        echo '<div class="tb-note bad">تست آنی خطا داد. لاگ پایین همین رکورد است.</div>';
     }
-    echo '</tr><tr>';
-    for ($i = 0; $i < $pad; $i++) {
-        echo '<td></td>';
+
+    $label = $edit['label'] ?? '';
+    $url = $edit['url'] ?? '';
+    $times = implode(' ', $edit['times'] ?? ['12:00']);
+    $everyday = !$edit || ($edit['mode'] ?? 'daily') !== 'pick';
+    echo '<form class="tb-card" method="post" action="' . esc_url(admin_url('admin-post.php')) . '">';
+    wp_nonce_field('tickban_save_site');
+    echo '<input type="hidden" name="action" value="tickban_save_site">';
+    echo '<input type="hidden" name="id" value="' . esc_attr($edit['id'] ?? '') . '">';
+    echo '<h2>' . ($edit ? 'ویرایش سایت' : 'ورود اطلاعات سایت') . '</h2>';
+    echo '<div class="tb-grid">';
+    echo '<label>نام سایت<input type="text" name="label" value="' . esc_attr($label) . '" placeholder="کلیدبان" required></label>';
+    echo '<label>آدرس سایت<input type="url" name="url" value="' . esc_attr($url) . '" placeholder="https://" required></label>';
+    echo '</div>';
+    echo '<label class="tb-every"><input type="checkbox" name="everyday" value="1"' . ($everyday ? ' checked' : '') . '> هر روز</label>';
+    echo '<div class="tb-days"><span>روزهای بازدید</span>';
+    foreach ($week as $num => $title) {
+        $on = $edit && in_array((string) $num, $edit['days'] ?? [], true) ? ' checked' : '';
+        echo '<label><input type="checkbox" name="days[]" value="' . esc_attr($num) . '"' . $on . '> ' . esc_html($title) . '</label>';
     }
-    for ($d = 1; $d <= $count; $d++) {
-        if (($pad + $d - 1) % 7 === 0 && $d !== 1) {
-            echo '</tr><tr>';
+    echo '</div>';
+    echo '<input type="hidden" name="mode" value="pick">';
+    echo '<label>ساعت بازدید<input type="text" name="times" value="' . esc_attr($times) . '" placeholder="09:00 16:00"></label>';
+    echo '<p class="tb-help">چند ساعت را با فاصله بنویسید. بین هر دو ساعت حداقل یک ساعت لازم است.</p>';
+    echo '<div class="tb-actions"><button class="tb-btn" type="submit">' . ($edit ? 'ذخیره ویرایش' : 'ثبت سایت') . '</button>';
+    if ($edit) {
+        echo '<a class="tb-btn ghost" href="' . esc_url(admin_url('admin.php?page=tickban')) . '">انصراف</a>';
+    }
+    echo '</div></form>';
+
+    echo '<section class="tb-list"><h2>سایت‌های ثبت‌شده</h2>';
+    if (!$monitors) {
+        echo '<p class="tb-help">هنوز سایتی ثبت نشده.</p>';
+    }
+    foreach ($monitors as $m) {
+        $last = tickban_latest($m['id']);
+        $state = $last ? (!empty($last['ok']) ? 'ok' : 'bad') : 'wait';
+        $state_text = $state === 'ok' ? 'سالم' : ($state === 'bad' ? 'خطا' : 'هنوز چک نشده');
+        $edit_url = admin_url('admin.php?page=tickban&edit=' . rawurlencode($m['id']));
+        $view_url = admin_url('admin.php?page=tickban&view=' . rawurlencode($m['id']));
+        $del_url = wp_nonce_url(admin_url('admin-post.php?action=tickban_delete&id=' . rawurlencode($m['id'])), 'tickban_delete');
+        $test_url = wp_nonce_url(admin_url('admin-post.php?action=tickban_check&id=' . rawurlencode($m['id'])), 'tickban_check');
+        echo '<article class="tb-site ' . esc_attr($state) . '">';
+        echo '<div class="tb-site-main"><span class="tb-dot" title="' . esc_attr($state_text) . '"></span><div>';
+        echo '<strong>' . esc_html($m['label'] !== '' ? $m['label'] : 'بدون نام') . '</strong>';
+        echo '<a class="tb-url" href="' . esc_url($m['url']) . '" target="_blank" rel="noopener">' . esc_html($m['url']) . '</a>';
+        echo '<p>' . esc_html(tickban_days_label($m)) . ' · ' . esc_html(implode(' ، ', $m['times'] ?? [])) . '</p>';
+        echo '<p class="tb-last">آخرین وضعیت: <b>' . esc_html($state_text) . '</b>';
+        if ($last) {
+            echo ' · ' . esc_html(($last['date'] ?? '') . ' ' . ($last['at'] ?? '')) . ' · کد ' . esc_html((string) ($last['code'] ?? ''));
         }
-        $key = $month . '-' . str_pad((string) $d, 2, '0', STR_PAD_LEFT);
-        $marks = [];
-        $bad = false;
-        foreach ($log as $lk => $row) {
-            if (str_contains($lk, '|' . $key . '|')) {
-                $marks[] = $row['slot'] . (!empty($row['ok']) ? ' ✓' : ' !');
-                if (empty($row['ok'])) {
-                    $bad = true;
+        echo '</p></div></div>';
+        echo '<div class="tb-icons">';
+        echo '<a class="tb-btn small" href="' . esc_url($view_url) . '">وضعیت</a>';
+        echo '<a class="tb-btn small dark" href="' . esc_url($test_url) . '">تست آنی</a>';
+        echo '<a class="tb-icon" href="' . esc_url($edit_url) . '" title="ویرایش"><span class="dashicons dashicons-edit"></span></a>';
+        echo '<a class="tb-icon danger" href="' . esc_url($del_url) . '" title="حذف" onclick="return confirm(\'این سایت حذف شود؟\')"><span class="dashicons dashicons-trash"></span></a>';
+        echo '</div></article>';
+    }
+    echo '</section>';
+
+    if ($view) {
+        $rows = tickban_history($view['id']);
+        $last = $rows[0] ?? null;
+        echo '<section class="tb-card tb-detail" id="tb-detail"><h2>مشخصات رکورد</h2>';
+        echo '<dl>';
+        echo '<div><dt>نام</dt><dd>' . esc_html($view['label']) . '</dd></div>';
+        echo '<div><dt>آدرس</dt><dd><a href="' . esc_url($view['url']) . '" target="_blank" rel="noopener">' . esc_html($view['url']) . '</a></dd></div>';
+        echo '<div><dt>روزها</dt><dd>' . esc_html(tickban_days_label($view)) . '</dd></div>';
+        echo '<div><dt>ساعت‌ها</dt><dd>' . esc_html(implode(' ، ', $view['times'] ?? [])) . '</dd></div>';
+        echo '</dl>';
+        $test_url = wp_nonce_url(admin_url('admin-post.php?action=tickban_check&id=' . rawurlencode($view['id'])), 'tickban_check');
+        echo '<p><a class="tb-btn dark" href="' . esc_url($test_url) . '">تست آنی وضعیت</a></p>';
+        if ($last && empty($last['ok'])) {
+            echo '<div class="tb-log"><h3>لاگ خطا</h3><p>کد ' . esc_html((string) $last['code']) . ' در ' . esc_html(($last['date'] ?? '') . ' ' . ($last['at'] ?? '')) . '</p>';
+            echo '<pre>' . esc_html($last['error'] !== '' ? $last['error'] : 'پاسخ نامعتبر، بدون متن خطا') . '</pre></div>';
+        } elseif ($last) {
+            echo '<div class="tb-log ok"><h3>آخرین چک سالم بود</h3><p>کد ' . esc_html((string) $last['code']) . ' در ' . esc_html(($last['date'] ?? '') . ' ' . ($last['at'] ?? '')) . '</p></div>';
+        }
+        if ($rows) {
+            echo '<h3>تاریخچه</h3><ul class="tb-hist">';
+            foreach (array_slice($rows, 0, 12) as $row) {
+                $cls = !empty($row['ok']) ? 'ok' : 'bad';
+                echo '<li class="' . $cls . '">' . esc_html(($row['date'] ?? '') . ' ' . ($row['at'] ?? '') . ' · اسلات ' . ($row['slot'] ?? '') . ' · کد ' . ($row['code'] ?? ''));
+                if (!empty($row['manual'])) {
+                    echo ' · دستی';
                 }
+                if (empty($row['ok']) && !empty($row['error'])) {
+                    echo '<br>' . esc_html($row['error']);
+                }
+                echo '</li>';
             }
+            echo '</ul>';
         }
-        $cls = $marks ? ($bad ? 'tb-bad' : 'tb-ok') : '';
-        echo '<td class="' . $cls . '"><div>' . $d . '</div><div style="font-size:11px">' . esc_html(implode(' ', $marks)) . '</div></td>';
+        echo '</section>';
     }
-    echo '</tr></table></div>';
 
-    echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '">';
-    wp_nonce_field('tickban_save');
-    echo '<input type="hidden" name="action" value="tickban_save">';
-    echo '<div class="tb-card"><h2>بله</h2><div class="tb-grid">';
-    echo '<div><label>توکن ربات</label><input type="text" name="bale_token" value="' . esc_attr($s['bale_token'] ?? '') . '" placeholder="123456:ABC"></div>';
-    echo '<div><label>آیدی عددی گیرنده</label><input type="text" name="bale_chat" value="' . esc_attr($s['bale_chat'] ?? '') . '"></div></div>';
-    echo '<label><input type="checkbox" name="notify_ok" ' . (!empty($s['notify_ok']) ? 'checked' : '') . '> بعد از چک موفق پیام بده</label>';
-    echo '<label><input type="checkbox" name="notify_fail" ' . (!empty($s['notify_fail']) ? 'checked' : '') . '> اگر جواب نداد هم پیام بده</label></div>';
+    echo '<form class="tb-card tb-bale" method="post" action="' . esc_url(admin_url('admin-post.php')) . '">';
+    wp_nonce_field('tickban_save_bale');
+    echo '<input type="hidden" name="action" value="tickban_save_bale">';
+    echo '<h2>خبر به بله</h2><div class="tb-grid">';
+    echo '<label>توکن ربات<input type="text" name="bale_token" value="' . esc_attr($s['bale_token'] ?? '') . '" placeholder="123456:ABC"></label>';
+    echo '<label>آیدی عددی گیرنده<input type="text" name="bale_chat" value="' . esc_attr($s['bale_chat'] ?? '') . '"></label></div>';
+    echo '<label class="tb-every"><input type="checkbox" name="notify_ok"' . (!empty($s['notify_ok']) ? ' checked' : '') . '> بعد از چک موفق پیام بده</label>';
+    echo '<label class="tb-every"><input type="checkbox" name="notify_fail"' . (!empty($s['notify_fail']) ? ' checked' : '') . '> اگر جواب نداد هم پیام بده</label>';
+    echo '<button class="tb-btn" type="submit">ذخیره بله</button></form>';
+    echo '<p class="tb-foot">تیک‌بان ۱.۲.۰ · کاریونیت</p></div>';
+}
 
-    echo '<div class="tb-card"><h2>آدرس‌ها</h2>';
-    foreach ($monitors as $i => $m) {
-        $times = implode(' ، ', $m['times'] ?? ['09:00']);
-        echo '<div class="tb-mon">';
-        echo '<label>نام</label><input type="text" name="label[' . $i . ']" value="' . esc_attr($m['label'] ?? '') . '">';
-        echo '<label>آدرس</label><input type="url" name="url[' . $i . ']" value="' . esc_attr($m['url'] ?? '') . '">';
-        echo '<label>بازه</label><select name="mode[' . $i . ']"><option value="daily"' . (($m['mode'] ?? '') !== 'pick' ? ' selected' : '') . '>هر روز</option><option value="pick"' . (($m['mode'] ?? '') === 'pick' ? ' selected' : '') . '>روزهای انتخابی</option></select>';
-        echo '<div class="tb-days">';
-        foreach ($week as $num => $title) {
-            $on = in_array((string) $num, $m['days'] ?? [], true) ? ' checked' : '';
-            echo '<label><input type="checkbox" name="days[' . $i . '][]" value="' . $num . '"' . $on . '> ' . $title . '</label>';
-        }
-        echo '</div>';
-        echo '<label>ساعت‌ها، با فاصله حداقل یک ساعت. مثال: 09:00 16:41</label><input type="text" name="times[' . $i . ']" value="' . esc_attr($times) . '">';
-        if (!empty($m['id'])) {
-            $url = wp_nonce_url(admin_url('admin-post.php?action=tickban_check&id=' . $m['id']), 'tickban_check');
-            echo '<p><a href="' . esc_url($url) . '">چک همین حالا</a></p>';
-        }
-        echo '</div>';
-    }
-    $n = count($monitors);
-    echo '<div class="tb-mon"><label>آدرس تازه</label><input type="url" name="url[' . $n . ']" placeholder="https://"><label>نام</label><input type="text" name="label[' . $n . ']"><input type="hidden" name="mode[' . $n . ']" value="daily"><label>ساعت</label><input type="text" name="times[' . $n . ']" placeholder="09:00"></div>';
-    submit_button('ذخیره تنظیمات');
-    echo '</div></form></div>';
+function tickban_css(): void
+{
+    echo '<style>
+    .tb{font-family:Vazirmatn,Tahoma,sans-serif;max-width:980px;color:#0D0D0D}
+    .tb-head{display:flex;gap:14px;align-items:center;margin:18px 0 8px}
+    .tb-mark{width:52px;height:52px;border-radius:14px;background:#F5C518;color:#0D0D0D;display:grid;place-items:center;font-weight:900;font-size:24px}
+    .tb h1{font-size:28px;font-weight:900;margin:0}
+    .tb h2{font-size:18px;font-weight:900;margin:0 0 12px}
+    .tb-head p,.tb-intro p,.tb-help,.tb-foot{color:#6E6E6E}
+    .tb-intro,.tb-card,.tb-site{background:#fff;border:1px solid #E8E8E8;border-radius:16px;padding:16px 18px;margin:12px 0;box-shadow:0 10px 30px rgba(13,13,13,.04)}
+    .tb-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .tb label{display:block;font-weight:700;margin:8px 0}
+    .tb input[type=text],.tb input[type=url]{width:100%;margin-top:6px;padding:10px 12px;border:1px solid #E8E8E8;border-radius:12px;background:#F4F4F4}
+    .tb-days{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+    .tb-days label,.tb-every{font-weight:500}
+    .tb-btn{display:inline-flex;align-items:center;justify-content:center;height:42px;padding:0 16px;border-radius:12px;background:#F5C518;color:#0D0D0D;font-weight:800;text-decoration:none;border:0;cursor:pointer}
+    .tb-btn.dark{background:#0D0D0D;color:#fff}
+    .tb-btn.ghost{background:#F4F4F4}
+    .tb-btn.small{height:36px;padding:0 12px}
+    .tb-actions{display:flex;gap:8px;margin-top:12px}
+    .tb-site{display:flex;justify-content:space-between;gap:12px;align-items:center}
+    .tb-site-main{display:flex;gap:12px;align-items:flex-start}
+    .tb-dot{width:14px;height:14px;border-radius:50%;margin-top:6px;background:#6E6E6E}
+    .tb-site.ok .tb-dot,.tb-hist .ok{background:#1E9E5A}
+    .tb-site.bad .tb-dot,.tb-hist .bad{background:#D93838}
+    .tb-site.ok{border-color:#b7e4c7}
+    .tb-site.bad{border-color:#f5b4b4}
+    .tb-url{display:block;color:#5C4A00;direction:ltr;text-align:right}
+    .tb-last b{font-weight:800}
+    .tb-icons{display:flex;gap:8px;align-items:center}
+    .tb-icon{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;background:#F4F4F4;color:#0D0D0D;text-decoration:none}
+    .tb-icon.danger{color:#D93838}
+    .tb-note{border-radius:12px;padding:10px 12px;margin:10px 0}
+    .tb-note.ok{background:#E6F6EE;color:#14663b}
+    .tb-note.bad,.tb-log{background:#FDECEC;color:#8d1f1f}
+    .tb-log.ok{background:#E6F6EE;color:#14663b}
+    .tb-log pre{white-space:pre-wrap;background:#fff;border-radius:10px;padding:10px}
+    .tb-detail dl{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .tb-detail dt{color:#6E6E6E}
+    .tb-hist{list-style:none;padding:0}
+    .tb-hist li{margin:6px 0;padding:8px 10px;border-radius:10px;background:#F4F4F4}
+    .tb-hist li.ok{background:#E6F6EE}
+    .tb-hist li.bad{background:#FDECEC}
+    .tb-foot{font-size:12px}
+    @media(max-width:700px){.tb-grid,.tb-detail dl,.tb-site{grid-template-columns:1fr;display:block}.tb-icons{margin-top:10px}}
+    </style>';
 }
